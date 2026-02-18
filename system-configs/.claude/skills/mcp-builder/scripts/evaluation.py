@@ -315,7 +315,7 @@ Examples:
   python evaluation.py -t sse -u https://example.com/mcp -H "Authorization: Bearer token" eval.xml
 
   # Evaluate an HTTP MCP server with custom model
-  python evaluation.py -t http -u https://example.com/mcp -m claude-3-5-sonnet-20241022 eval.xml
+  python evaluation.py -t http -u https://example.com/mcp -m claude-sonnet-4-6 eval.xml
         """,
     )
 
