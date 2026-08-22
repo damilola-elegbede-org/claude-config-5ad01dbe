@@ -71,7 +71,10 @@ WHILE: has_more_threads
 
     SET: root = thread.comments.nodes[0]          # the thread's originating comment
     SET: issue.source = CLASSIFY(root.author.login)   # see source classification below
-    IF: issue.source == "self" → SKIP              # our own prior resolution replies
+    IF: issue.source == "self" → SKIP
+      The thread was opened by the account this skill is running as — don't triage our own
+      review findings. (Resolution replies never trigger this: a reply joins an existing
+      thread, so the root comment stays the original reviewer's.)
     SET: issue.line = root.line ?? root.originalLine   # line is null on outdated threads
     SET: issue.location = "{root.path}:{issue.line ?? "?"}"
       (append " (outdated)" when thread.isOutdated)
@@ -83,7 +86,11 @@ WHILE: has_more_threads
 
 The outer loop paginates threads (>100); the inner loop paginates comments within a thread (>100).
 Threads are collected from **every** reviewer — bot or human. Only two things drop a thread:
-`isResolved == true`, and a root comment authored by us (our own previous resolution replies).
+`isResolved == true`, and a thread opened by the account we're running as.
+
+That second rule assumes the running account isn't also a reviewer on this PR. If the skill is ever
+run under a bot identity that posts its own reviews, that bot's findings would be classified `self`
+and silently dropped — narrow the `self` check to the PR author, or drop it, before doing that.
 
 ### Source classification
 
