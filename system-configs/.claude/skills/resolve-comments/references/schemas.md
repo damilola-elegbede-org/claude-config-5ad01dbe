@@ -20,7 +20,7 @@ its historical name. Its contents are source-agnostic: each record names its own
       "location": "file.ts:45",
       "description": "Issue description",
       "severity": "LOW",
-      "category": "nitpick|low-priority|user-skipped|human-thread-deferred",
+      "category": "nitpick|low-priority|user-skipped|human-thread-deferred|out-of-scope-edit",
       "reason": "Auto-generated reason from evaluation"
     }
   ]
