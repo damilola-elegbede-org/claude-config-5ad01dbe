@@ -20,7 +20,8 @@ VALIDATE: pr-number is a positive numeric integer <= 2147483647
 ## STEP 2: Fetch unresolved review threads (all sources, paginated)
 
 ```text
-INITIALIZE: all_issues = [], threads_cursor = null, has_more_threads = true, modified_files = []
+INITIALIZE: all_issues = [], retry_resolve_issues = [], threads_cursor = null, has_more_threads = true,
+  modified_files = []
 
 VALIDATE: owner/repo from gh repo view --json owner,name
   These values are interpolated into shell/API arguments — treat as a trust boundary.
@@ -77,20 +78,24 @@ WHILE: has_more_threads
 
     IF: ANY comment in thread.comments.nodes (excluding root) has
           author.login == authenticated_user AND body starts with the resolution marker
-      → SKIP
+      → APPEND {thread_id, location: "{root.path}:{root.line ?? root.originalLine ?? "?"}"}
+        to retry_resolve_issues; CONTINUE to next thread (do not add to all_issues)
       An earlier run already replied to this thread but did not finish resolving it — the
       reply landed and the resolve mutation failed, or the run was interrupted between the
-      two. Without this guard that thread is still unresolved, so the next run re-triages
-      it, re-applies the fix, and posts a duplicate reply. Scanning the whole comment list
+      two. `thread.isResolved == false` here proves the resolve never completed, since an
+      already-resolved thread was filtered out above. Re-fixing and re-replying would
+      duplicate the comment; only `resolveReviewThread` needs to run again, and it's
+      idempotent — calling it on an already-resolved thread is a no-op, not an error. This
+      is also what keeps a stuck thread from becoming permanently unresolvable: a blind SKIP
+      would drop it every run with no path back to resolved. Scanning the whole comment list
       is what catches it: our reply is never the root, because a reply joins an existing
       thread and the root stays the reviewer's.
       RESOLUTION MARKER: the reply bodies this skill composes always begin with
         "Fixed: ", "Acknowledged: ", "@coderabbitai resolve - Fixed: ", or
         "@coderabbitai resolve - Acknowledged: ".
-      OUTPUT: "Skipped {path}:{line} - already replied by a previous run (thread left open)"
-      Report the count at the end of STEP 2 so a stuck thread is visible rather than silent:
-        "⚠️ {n} thread(s) had a prior reply but are still unresolved - resolve them by hand
-         or re-run after checking why the resolve mutation failed"
+      OUTPUT: "{path}:{line} - prior reply found, retrying resolve only (no new fix or reply)"
+      Report the count at the end of STEP 2: "{n} thread(s) had a prior reply - retrying
+        resolveReviewThread only"
     SET: issue.line = root.line ?? root.originalLine   # line is null on outdated threads
     SET: issue.location = "{root.path}:{issue.line ?? "?"}"
       (append " (outdated)" when thread.isOutdated)
@@ -101,9 +106,10 @@ WHILE: has_more_threads
 ```
 
 The outer loop paginates threads (>100); the inner loop paginates comments within a thread (>100).
-Threads are collected from **every** reviewer — bot or human. Only three things drop a thread:
-`isResolved == true`, a thread opened by the account we're running as, and a thread this skill
-already replied to.
+Threads are collected from **every** reviewer — bot or human. Only two things drop a thread from
+`all_issues` entirely: `isResolved == true`, and a thread opened by the account we're running as.
+A thread this skill already replied to is not dropped — it's redirected to
+`retry_resolve_issues` so the resolve mutation gets another attempt without repeating the fix.
 
 The `self` rule assumes the running account isn't also a reviewer on this PR. If the skill is ever
 run under a bot identity that posts its own reviews, that bot's findings would be classified `self`
@@ -248,10 +254,46 @@ SET: all_issues = fixed_issues + (skipped_issues excluding deferred_human_issues
   the PR summary; they are recorded in the ignored-issues file and reported on their own line:
     IF: deferred_human_issues non-empty
       OUTPUT "{n} human thread(s) left open for review (not resolved by this run)"
-IF: all_issues empty → OUTPUT "No issues to post resolutions for"; SKIP this block
+IF: all_issues empty AND retry_resolve_issues empty
+  → OUTPUT "No issues to post resolutions for"; SKIP this block
 INITIALIZE: resolution_results = [], touched_thread_ids = [], success_count = 0, failure_count = 0
 
+FOR_EACH: issue in retry_resolve_issues   # resolve only — reply already exists, never repost
+  TRY:
+    RUN: gh api graphql -f query='
+      mutation($threadId: ID!) {
+        resolveReviewThread(input: { threadId: $threadId }) {
+          thread { id isResolved }
+        }
+      }' -F threadId="{issue.thread_id}"
+    PARSE: resolved = .data.resolveReviewThread.thread.isResolved
+    IF: resolved != true
+      INCREMENT failure_count
+      OUTPUT "Warning: Retry left thread unresolved: {issue.location}"
+    ELSE
+      APPEND issue.thread_id to touched_thread_ids
+      INCREMENT success_count
+      OUTPUT "Resolved thread (retry, no new reply): {issue.location}"
+  ON_ERROR:
+    CAPTURE error; INCREMENT failure_count
+    OUTPUT "Warning: Retry failed to resolve {issue.location}: {error_message}"
+  Idempotent by construction: if a concurrent run already resolved this exact thread between
+  STEP 2's fetch and this mutation, `resolveReviewThread` on an already-resolved thread returns
+  `isResolved: true` and succeeds — it does not error or double-post, so racing this branch
+  against another run's successful resolve is safe.
+
 FOR_EACH: issue in all_issues          # every thread needs its own mutation — never batch
+  RECHECK: single-thread GraphQL query for issue.thread_id → { isResolved, comments(last: 5)
+    { nodes { author { login } body } } } immediately before composing this issue's reply.
+    This narrows, not eliminates, the window between STEP 2's fetch and this write — it catches
+    a concurrent run that claimed the same thread while this run was mid-triage (fix generation,
+    the commit/push confirmation prompt) without requiring a distributed lock.
+    IF: isResolved == true → OUTPUT "Skipped {issue.location} - resolved by another run since
+      fetch"; CONTINUE to next issue (do not reply, do not resolve — already done)
+    IF: ANY comment (excluding root) has author.login == authenticated_user AND body starts
+      with the resolution marker → OUTPUT "Skipped {issue.location} - claimed by another run
+      since fetch, resolving only"; run the same resolve-only mutation as the
+      retry_resolve_issues branch above for this thread_id, then CONTINUE to next issue
   IF: issue.thread_id missing/empty
     APPEND {location, status:"skipped", error:"missing thread_id"}; INCREMENT failure_count
     OUTPUT "Warning: Skipped {issue.location} - missing thread_id"; CONTINUE
