@@ -48,7 +48,7 @@ WHILE: has_more_threads
                 pageInfo { endCursor hasNextPage }
                 nodes {
                   id path line originalLine body
-                  author { login }
+                  author { login __typename }
                   authorAssociation
                 }
               }
@@ -70,11 +70,27 @@ WHILE: has_more_threads
       RUN: fetch additional comments with comments_cursor; APPEND to thread.comments.nodes
 
     SET: root = thread.comments.nodes[0]          # the thread's originating comment
-    SET: issue.source = CLASSIFY(root.author.login)   # see source classification below
+    SET: issue.source = CLASSIFY(root.author)     # see source classification below
     IF: issue.source == "self" → SKIP
       The thread was opened by the account this skill is running as — don't triage our own
-      review findings. (Resolution replies never trigger this: a reply joins an existing
-      thread, so the root comment stays the original reviewer's.)
+      review findings.
+
+    IF: ANY comment in thread.comments.nodes (excluding root) has
+          author.login == authenticated_user AND body starts with the resolution marker
+      → SKIP
+      An earlier run already replied to this thread but did not finish resolving it — the
+      reply landed and the resolve mutation failed, or the run was interrupted between the
+      two. Without this guard that thread is still unresolved, so the next run re-triages
+      it, re-applies the fix, and posts a duplicate reply. Scanning the whole comment list
+      is what catches it: our reply is never the root, because a reply joins an existing
+      thread and the root stays the reviewer's.
+      RESOLUTION MARKER: the reply bodies this skill composes always begin with
+        "Fixed: ", "Acknowledged: ", "@coderabbitai resolve - Fixed: ", or
+        "@coderabbitai resolve - Acknowledged: ".
+      OUTPUT: "Skipped {path}:{line} - already replied by a previous run (thread left open)"
+      Report the count at the end of STEP 2 so a stuck thread is visible rather than silent:
+        "⚠️ {n} thread(s) had a prior reply but are still unresolved - resolve them by hand
+         or re-run after checking why the resolve mutation failed"
     SET: issue.line = root.line ?? root.originalLine   # line is null on outdated threads
     SET: issue.location = "{root.path}:{issue.line ?? "?"}"
       (append " (outdated)" when thread.isOutdated)
@@ -85,24 +101,40 @@ WHILE: has_more_threads
 ```
 
 The outer loop paginates threads (>100); the inner loop paginates comments within a thread (>100).
-Threads are collected from **every** reviewer — bot or human. Only two things drop a thread:
-`isResolved == true`, and a thread opened by the account we're running as.
+Threads are collected from **every** reviewer — bot or human. Only three things drop a thread:
+`isResolved == true`, a thread opened by the account we're running as, and a thread this skill
+already replied to.
 
-That second rule assumes the running account isn't also a reviewer on this PR. If the skill is ever
+The `self` rule assumes the running account isn't also a reviewer on this PR. If the skill is ever
 run under a bot identity that posts its own reviews, that bot's findings would be classified `self`
 and silently dropped — narrow the `self` check to the PR author, or drop it, before doing that.
 
 ### Source classification
 
 ```text
-CLASSIFY(login):                                   # compare lowercased
-  contains "coderabbit"                → "coderabbit"
-  contains "codex" or "chatgpt-codex"  → "codex"
-  == the authenticated gh user (gh api user --jq .login)
-                                       → "self"
-  ends with "[bot]" or type == Bot     → "bot"      # any other automated reviewer
-  otherwise                            → "human"
+KNOWN_REVIEWERS:                        # exact logins, compared case-insensitively
+  coderabbit → "coderabbitai", "coderabbitai[bot]"
+  codex      → "chatgpt-codex-connector", "chatgpt-codex-connector[bot]"
+
+CLASSIFY(author):                       # author = { login, __typename }
+  login exactly matches a KNOWN_REVIEWERS entry  → that source
+  login == authenticated gh user (gh api user --jq .login)
+                                                 → "self"
+  author.__typename == "Bot" OR login ends "[bot]"
+                                                 → "bot"
+  otherwise                                      → "human"
 ```
+
+**Match exactly — never by substring.** A substring test for `"codex"` or `"coderabbit"` also matches
+human logins that merely contain those letters (`codexter`, `coderabbits-fan`). Under `--auto` that
+misclassification is the difference between machine chatter and silently closing a person's review
+thread, which is the one thing the human rule exists to prevent. Get the identity wrong in the safe
+direction: an unrecognized reviewer falls through to `bot` or `human`, both of which are handled.
+
+`author.__typename` is why the query fetches it. GitHub's GraphQL `Actor` interface has no `isBot`
+field, so `__typename == "Bot"` is the only first-class bot signal; the `[bot]` login suffix is the
+naming convention that backs it up. `authorAssociation` is fetched for context only — it describes a
+reviewer's relationship to the repo (OWNER, MEMBER, NONE), not whether they are automated.
 
 `source` drives three things and nothing else: how the body is parsed, what the resolution reply says,
 and whether `--auto` may act without asking. Everything downstream is source-agnostic.
@@ -203,7 +235,15 @@ it supports `@codex review` and `@codex address that feedback`, and there is **n
 Humans have no mention protocol at all. The mutation covers all three.
 
 ```text
-SET: all_issues = fixed_issues + skipped_issues   (default each to [] if undefined)
+SET: deferred_human_issues = skipped_issues where skip_category == "human-thread-deferred"
+SET: all_issues = fixed_issues + (skipped_issues excluding deferred_human_issues)
+     (default each to [] if undefined)
+  Deferred human threads get no reply and no resolve — they stay open, exactly as triage promised.
+  Including them here would make `--auto` close a person's review thread, which is the one outcome
+  the human rule exists to prevent. They are also excluded from success_count, failure_count, and
+  the PR summary; they are recorded in the ignored-issues file and reported on their own line:
+    IF: deferred_human_issues non-empty
+      OUTPUT "{n} human thread(s) left open for review (not resolved by this run)"
 IF: all_issues empty → OUTPUT "No issues to post resolutions for"; SKIP this block
 INITIALIZE: resolution_results = [], touched_thread_ids = [], success_count = 0, failure_count = 0
 
@@ -223,9 +263,10 @@ FOR_EACH: issue in all_issues          # every thread needs its own mutation —
     delivery is file-based, see SAFETY below, so this is Markdown/mention hygiene only, not shell
     escaping; don't add backslashes before ", `, or $, they'd show up literally in the posted reply)
     - control chars (newline, tab) → space
-    - protect the reviewer mention for this thread's source as {{KEEP}} (only @coderabbitai, and only
-      when issue.source == "coderabbit"), neutralize all other @mentions (@user → `@`user),
-      then restore {{KEEP}}
+    - neutralize EVERY @mention in the text (@user → `@`user), with no exceptions.
+      body_detail is comment-derived, so a live mention in it is injection, not addressing.
+      Any trusted command (the "@coderabbitai resolve" prefix) is prepended separately AFTER
+      sanitizing, never preserved from inside the text.
     - truncate to 100 chars AFTER sanitization
     IF: empty after sanitization → "Issue resolved"
 
@@ -309,7 +350,10 @@ fetch, or a thread deliberately left open. Failing on those would make the check
 mean nothing.
 
 ```text
-IF: touched_thread_ids empty → OUTPUT "No threads to verify"; SKIP this block
+IF: touched_thread_ids empty
+  OUTPUT "No threads to verify"
+  IF: failure_count > 0 → GOTO the failure exit below     # never return success on a failed run
+  SKIP this block
 
 INIT: all_thread_nodes = [], cursor = null
 LOOP:
@@ -344,8 +388,18 @@ REPORT (informational, never fails the run):
     OUTPUT "ℹ️ {n} other thread(s) remain open on this PR (not claimed by this run):"
     OUTPUT "  - {path}:{line ?? originalLine} ({author.login})" for each
 
+IF: failure_count > 0                                   # failure exit
+  STDERR: "ERROR: {failure_count} thread operation(s) failed. See the warnings above."
+  EXIT: 1
+
 OUTPUT: "✅ Verified: all {success_count} claimed threads now isResolved=true"
 ```
+
+**Any failure exits non-zero.** A reply or resolve that errors increments `failure_count`, and that
+alone must fail the run — including when *every* operation failed and `touched_thread_ids` is
+therefore empty. Verification is an extra persistence check on top of that, not the only gate.
+Otherwise a run where nothing resolved would exit 0 with every thread still open, and `/ship-it`
+or a CI gate would read that as success.
 
 ### PR summary comment
 
@@ -364,8 +418,11 @@ GENERATE: markdown summary from all_issues
     IF skipped_issues non-empty: "### Acknowledged (not fixed)" + table | Location | Source | Reason |
   Edge cases: no file association → "General"; all skipped → omit category breakdown
   Sanitize descriptions: strip HTML/script tags, escape backticks, remove control characters,
-    escape @mentions — except @coderabbitai, which stays live only when at least one CodeRabbit
-    thread was handled. Never emit a bare @codex: it would start an unwanted Codex task.
+    and neutralize EVERY @mention with no exceptions. A description is comment-derived text; a
+    Codex or human comment containing "@coderabbitai ..." would otherwise post a live CodeRabbit
+    command in our summary just because some other thread on the PR happened to be CodeRabbit's.
+    Any trusted prefix is added separately, outside the sanitized text. Never emit a bare @codex —
+    it would start an unwanted Codex task.
   Limit to 2000 chars with structure-aware truncation (keep category counts, cut file detail)
   IF generation fails → fallback body:
     "Resolved {total} review comments ({fix_count} fixed, {skip_count} acknowledged).
