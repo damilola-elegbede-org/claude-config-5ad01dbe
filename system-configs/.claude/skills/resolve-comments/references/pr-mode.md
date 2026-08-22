@@ -84,8 +84,11 @@ WHILE: has_more_threads
 
     IF: ANY comment in thread.comments.nodes (excluding root) has
           author.login == authenticated_user AND body starts with the resolution marker
-      → APPEND {thread_id, location: "{root.path}:{root.line ?? root.originalLine ?? "?"}"}
+      → APPEND {thread_id, source: issue.source,
+                 location: "{root.path}:{root.line ?? root.originalLine ?? "?"}"}
         to retry_resolve_issues; CONTINUE to next thread (do not add to all_issues)
+        The source travels with it — retrying a stuck thread still respects who owns the
+        resolve, so a CodeRabbit thread gets its reply re-posted rather than resolved for it.
       An earlier run already replied to this thread but did not finish resolving it — the
       reply landed and the resolve mutation failed, or the run was interrupted between the
       two. `thread.isResolved == false` here proves the resolve never completed, since an
@@ -237,34 +240,67 @@ IF: fixes applied
 
 ### Post thread resolutions (do not skip)
 
-Two separate operations per thread, in this order:
+**Each reviewer owns resolving its own threads. Use their protocol, don't override it.**
 
-1. **Reply** — a comment on the thread explaining what happened. Skipped issues get an
-   acknowledgment reply too, so threads don't sit open with no explanation.
-2. **Resolve** — `resolveReviewThread`, GitHub's native mutation. This is what actually flips
-   `isResolved`, and it works identically for CodeRabbit, Codex, humans, and any other reviewer.
+| Source       | Reply                                        | Who resolves                         | How we confirm                       |
+| ------------ | -------------------------------------------- | ------------------------------------ | ------------------------------------ |
+| `coderabbit` | `@coderabbitai resolve - {prefix}: {detail}` | **CodeRabbit**, acting on that reply | wait, then re-query `isResolved`     |
+| `codex`      | `{prefix}: {detail}`                         | **us**, `resolveReviewThread`        | mutation returns `isResolved`        |
+| `bot`        | `{prefix}: {detail}`                         | **us**, `resolveReviewThread`        | mutation returns `isResolved`        |
+| `human`      | `{prefix}: {detail}`                         | **the human** — never us             | not confirmed; reported as left open |
 
-The mutation is the mechanism. **Never depend on a reviewer bot resolving the thread for us.**
-CodeRabbit will act on an `@coderabbitai resolve` reply, so we keep that prefix for its threads —
-but only as a courtesy, so CodeRabbit's own state agrees with GitHub's. Codex has no equivalent:
-it supports `@codex review` and `@codex address that feedback`, and there is **no `@codex resolve`**.
-Humans have no mention protocol at all. The mutation covers all three.
+The rule behind the table: **use the reviewer's own resolution protocol where one exists, and never
+close a person's thread for them.**
+
+- **CodeRabbit has a protocol** — it watches for `@coderabbitai resolve` and flips the thread itself.
+  Calling `resolveReviewThread` on its threads would bypass that and leave CodeRabbit's own state
+  disagreeing with GitHub's. Post the reply; let CodeRabbit do its job. This is asynchronous, which
+  is why CodeRabbit threads need a wait before verification.
+- **Codex has none.** It supports `@codex review`, `@codex security review`, and
+  `@codex address that feedback` — there is no `@codex resolve`, and a bare `@codex` prefix would
+  start an unwanted Codex task. Nobody resolves a Codex thread unless we do, so we call the mutation.
+- **Other bots** are treated like Codex: no known protocol, and no person to defer to, so we resolve
+  them. If a bot turns out to have its own resolve command, give it a `KNOWN_REVIEWERS` entry and its
+  own row here rather than resolving it out from under itself.
+- **Humans resolve their own threads.** Reply so they can see what was done, then leave it to them.
+  Closing a colleague's review thread is a social act, not a mechanical one, and a person may not
+  agree that their point was addressed. A thread left open is cheap; a concern silently closed is not.
 
 ```text
 SET: deferred_human_issues = skipped_issues where skip_category == "human-thread-deferred"
 SET: all_issues = fixed_issues + (skipped_issues excluding deferred_human_issues)
      (default each to [] if undefined)
-  Deferred human threads get no reply and no resolve — they stay open, exactly as triage promised.
-  Including them here would make `--auto` close a person's review thread, which is the one outcome
-  the human rule exists to prevent. They are also excluded from success_count, failure_count, and
-  the PR summary; they are recorded in the ignored-issues file and reported on their own line:
+  Deferred human threads get no reply at all — triage held them back from `--auto`, so nothing
+  has been decided about them yet. They are excluded from the counts and the PR summary, recorded
+  in the ignored-issues file, and reported on their own line:
     IF: deferred_human_issues non-empty
-      OUTPUT "{n} human thread(s) left open for review (not resolved by this run)"
+      OUTPUT "{n} human thread(s) held for review (no reply posted, thread left open)"
 IF: all_issues empty AND retry_resolve_issues empty
   → OUTPUT "No issues to post resolutions for"; SKIP this block
-INITIALIZE: resolution_results = [], touched_thread_ids = [], success_count = 0, failure_count = 0
+INITIALIZE: resolution_results = [], awaiting_coderabbit = [], resolved_thread_ids = [],
+            left_to_human = [], success_count = 0, failure_count = 0
 
-FOR_EACH: issue in retry_resolve_issues   # resolve only — reply already exists, never repost
+FOR_EACH: issue in retry_resolve_issues   # our reply already exists — never repost the finding
+  A previous run replied here but the thread is still unresolved. What "retry" means depends on
+  who owns the resolve — the same ownership rule as everywhere else, not a blanket mutation:
+
+  IF: issue.source == "human"
+    APPEND issue to left_to_human
+    OUTPUT "Left open for the reviewer (human, replied earlier): {issue.location}"
+    CONTINUE                    # nothing to retry — the thread is theirs to close
+
+  IF: issue.source == "coderabbit"
+    Our earlier "@coderabbitai resolve" reply IS the resolve request, and CodeRabbit did not act
+    on it. Re-post that reply — it is the only lever we have — rather than resolving the thread
+    out from under CodeRabbit. This is the one case where a repost is correct: the reply is a
+    command that failed to take, not a duplicate finding.
+    RE-POST: "@coderabbitai resolve - {body_prefix}: {body_detail}" via the same file-based path
+      used in the main loop below
+    APPEND issue to awaiting_coderabbit; INCREMENT success_count
+    OUTPUT "Re-posted @coderabbitai resolve (prior reply did not take): {issue.location}"
+    CONTINUE
+
+  # codex and bot — we own the resolve, so retry the mutation alone
   TRY:
     RUN: gh api graphql -f query='
       mutation($threadId: ID!) {
@@ -277,7 +313,7 @@ FOR_EACH: issue in retry_resolve_issues   # resolve only — reply already exist
       INCREMENT failure_count
       OUTPUT "Warning: Retry left thread unresolved: {issue.location}"
     ELSE
-      APPEND issue.thread_id to touched_thread_ids
+      APPEND issue.thread_id to resolved_thread_ids
       INCREMENT success_count
       OUTPUT "Resolved thread (retry, no new reply): {issue.location}"
   ON_ERROR:
@@ -298,8 +334,9 @@ FOR_EACH: issue in all_issues          # every thread needs its own mutation —
       fetch"; CONTINUE to next issue (do not reply, do not resolve — already done)
     IF: ANY comment (excluding root) has author.login == authenticated_user AND body starts
       with the resolution marker → OUTPUT "Skipped {issue.location} - claimed by another run
-      since fetch, resolving only"; run the same resolve-only mutation as the
-      retry_resolve_issues branch above for this thread_id, then CONTINUE to next issue
+      since fetch"; hand this thread to the `retry_resolve_issues` branch above and follow it
+      for this issue.source (human → leave open, coderabbit → re-post the resolve reply,
+      codex/bot → resolve-only mutation), then CONTINUE to next issue
   IF: issue.thread_id missing/empty
     APPEND {location, status:"skipped", error:"missing thread_id"}; INCREMENT failure_count
     OUTPUT "Warning: Skipped {issue.location} - missing thread_id"; CONTINUE
@@ -317,17 +354,15 @@ FOR_EACH: issue in all_issues          # every thread needs its own mutation —
     - control chars (newline, tab) → space
     - neutralize EVERY @mention in the text (@user → `@`user), with no exceptions.
       body_detail is comment-derived, so a live mention in it is injection, not addressing.
-      Any trusted command (the "@coderabbitai resolve" prefix) is prepended separately AFTER
-      sanitizing, never preserved from inside the text.
+      The trusted "@coderabbitai resolve" prefix is prepended separately AFTER sanitizing,
+      never preserved from inside the text.
     - truncate to 100 chars AFTER sanitization
     IF: empty after sanitization → "Issue resolved"
 
   COMPOSE reply body by source:
     coderabbit → "@coderabbitai resolve - {body_prefix}: {body_detail}"
     codex      → "{body_prefix}: {body_detail}"
-      Do NOT prefix with @codex — a bare @codex mention starts a new Codex task. Only
-      "@codex review" / "@codex address that feedback" are meaningful, and neither is wanted here.
-    human, bot → "{body_prefix}: {body_detail}"
+    bot, human → "{body_prefix}: {body_detail}"
 
   NOTE: thread_id is opaque per GitHub docs — never decode or pattern-validate node IDs, and never
     build a filesystem path out of it or issue.id for the same reason (see SET below).
@@ -335,7 +370,7 @@ FOR_EACH: issue in all_issues          # every thread needs its own mutation —
   SAFETY: body_detail crosses a trust boundary — it's derived from a PR review comment written by
     someone else (a bot or another person), not typed by the user. This applies to every source
     equally; a Codex finding and a human comment are no more trusted than a CodeRabbit one.
-    Never build the mutation by splicing it into a shell string that then gets re-parsed. Write the
+    Never build the call by splicing it into a shell string that then gets re-parsed. Write the
     composed message to a file and pass it with gh's `@file` syntax, which reads the value as
     literal bytes with no shell re-interpretation of its contents — this is the control, so
     body_detail is never string-escaped (escaping it would corrupt the literal bytes posted).
@@ -355,21 +390,39 @@ FOR_EACH: issue in all_issues          # every thread needs its own mutation —
           pullRequestReviewThreadId: $threadId, body: $body
         }) { comment { id } }
       }' -F threadId="{issue.thread_id}" -F "body=@{reply_file}"
+  ON_ERROR:
+    CAPTURE error; INCREMENT failure_count
+    OUTPUT "Warning: Failed to reply on {issue.location}: {error_message}"
+    CONTINUE                       # never resolve a thread we could not explain ourselves on
+  FINALLY:
+    DELETE: {reply_file} if it exists — runs whether the call succeeded, failed, or the
+      surrounding step was interrupted, so no reply file survives this iteration
 
+  # --- RESOLVE step: who acts depends on the source ---
+  IF: issue.source == "human"
+    APPEND issue to left_to_human; INCREMENT success_count
+    OUTPUT "Replied, left open for the reviewer (human): {issue.location}"
+    CONTINUE
+
+  IF: issue.source == "coderabbit"
+    APPEND issue to awaiting_coderabbit; INCREMENT success_count
+    OUTPUT "Replied @coderabbitai resolve (coderabbit): {issue.location}"
+    CONTINUE
+
+  # codex and bot — nobody else will resolve these
+  TRY:
     RUN: gh api graphql -f query='
       mutation($threadId: ID!) {
         resolveReviewThread(input: { threadId: $threadId }) {
           thread { id isResolved }
         }
       }' -F threadId="{issue.thread_id}"
-
     PARSE: resolved = .data.resolveReviewThread.thread.isResolved
     IF: resolved != true
       INCREMENT failure_count
       OUTPUT "Warning: Reply posted but thread not resolved: {issue.location}"
     ELSE
-      APPEND issue.thread_id to touched_thread_ids
-      INCREMENT success_count
+      APPEND issue.thread_id to resolved_thread_ids; INCREMENT success_count
       OUTPUT "Resolved thread ({issue.source}, {body_prefix}): {issue.location}"
   ON_ERROR:
     CAPTURE error; INCREMENT failure_count
@@ -377,35 +430,44 @@ FOR_EACH: issue in all_issues          # every thread needs its own mutation —
       OUTPUT "Warning: Cannot resolve {issue.location} - requires write access to the repository"
     ELSE
       OUTPUT "Warning: Failed to resolve {issue.location}: {error_message}"
-  FINALLY:
-    DELETE: {reply_file} if it exists — runs whether the mutation succeeded, failed, or the
-      surrounding step was interrupted, so no reply file survives this iteration
 
 OUTPUT: "Thread resolution complete: {success_count} succeeded, {failure_count} failed"
+  followed by the breakdown:
+    "  resolved by us: {resolved_thread_ids|length}"
+    "  awaiting CodeRabbit: {awaiting_coderabbit|length}"
+    "  left for a human: {left_to_human|length}"
 IF: failure_count > 0 → OUTPUT the failed locations
-IF: success_count == 0 AND failure_count > 0 → OUTPUT "⚠️ WARNING: All thread resolutions failed."
+IF: success_count == 0 AND failure_count > 0 → OUTPUT "⚠️ WARNING: All thread operations failed."
 IF: success_count > 0 AND failure_count > 0 → OUTPUT "⚠️ Partial success: {success}/{failure}"
 ```
 
-The reply is posted **before** the resolve, so the explanation is visible on the thread when it
-collapses. If the reply fails, the resolve is skipped — never resolve a thread silently.
+The reply always comes first, and a thread whose reply failed is never resolved — we don't close
+anything we couldn't explain ourselves on.
 
 ### Post-resolution verification (exit 1 on failure)
 
-`resolveReviewThread` returns `thread { isResolved }` synchronously, so the mutation response is the
-primary confirmation and there is nothing to wait for. Re-query anyway as a guard against a mutation
-that reported success but did not persist.
+Three sources, three different things to confirm:
 
-**Scope the check to the threads this run touched.** A PR reviewed by CodeRabbit, Codex, and a human
-will routinely have open threads this run never claimed — from a reviewer that commented after the
-fetch, or a thread deliberately left open. Failing on those would make the check fire constantly and
+- **We resolved it** (`codex`, `bot`) — `resolveReviewThread` returned `isResolved` synchronously.
+  Re-query anyway, as a guard against a mutation that reported success but did not persist.
+- **CodeRabbit resolves it** (`coderabbit`) — asynchronous. CodeRabbit has to observe our reply and
+  set `isResolved` server-side, so this needs a wait before re-querying. If it silently fails, a
+  later run or an automated gate still sees unresolved threads while the PR may look ready.
+- **A human resolves it** (`human`) — on their schedule, not this run's. Never waited on, never
+  verified, and never a failure.
+
+**Scope the check to threads this run acted on.** A PR reviewed by several parties will routinely
+have open threads this run never claimed. Failing on those would make the check fire constantly and
 mean nothing.
 
 ```text
-IF: touched_thread_ids empty
+IF: resolved_thread_ids and awaiting_coderabbit both empty
   OUTPUT "No threads to verify"
   IF: failure_count > 0 → GOTO the failure exit below     # never return success on a failed run
-  SKIP this block
+  SKIP the query
+
+IF: awaiting_coderabbit non-empty
+  SLEEP: 30 seconds     # CodeRabbit needs time to observe the replies and resolve
 
 INIT: all_thread_nodes = [], cursor = null
 LOOP:
@@ -427,31 +489,42 @@ LOOP:
   IF: not hasNextPage → BREAK
   SET: cursor = endCursor
 
-FILTER: claimed = nodes where id IN touched_thread_ids
-PARSE:  unresolved = claimed where isResolved == false
+SET: claimed = resolved_thread_ids + (thread ids in awaiting_coderabbit)
+FILTER: unresolved = nodes where id IN claimed AND isResolved == false
 IF: unresolved non-empty
-  STDERR: "ERROR: {n} thread(s) this run claimed to resolve are still open:"
-  STDERR: "  - {thread.id} @ {path}:{line ?? originalLine} ({author.login})" for each
+  STDERR: "ERROR: {n} thread(s) this run acted on are still open:"
+  FOR_EACH: "  - {thread.id} @ {path}:{line ?? originalLine} ({author.login})"
+    IF: the id is in awaiting_coderabbit
+      STDERR: "    replied @coderabbitai resolve but CodeRabbit has not resolved it"
+    ELSE
+      STDERR: "    resolveReviewThread reported success but the thread is still open"
   EXIT: 1
 
 REPORT (informational, never fails the run):
-  SET: untouched_open = nodes where isResolved == false AND id NOT IN touched_thread_ids
+  IF: left_to_human non-empty
+    OUTPUT "ℹ️ {n} thread(s) replied to and left for their reviewer to resolve:"
+    OUTPUT "  - {location} ({author.login})" for each
+  SET: untouched_open = nodes where isResolved == false AND id NOT IN claimed
+       AND id NOT IN (left_to_human thread ids)
   IF: untouched_open non-empty
-    OUTPUT "ℹ️ {n} other thread(s) remain open on this PR (not claimed by this run):"
+    OUTPUT "ℹ️ {n} other thread(s) remain open on this PR (not acted on by this run):"
     OUTPUT "  - {path}:{line ?? originalLine} ({author.login})" for each
 
 IF: failure_count > 0                                   # failure exit
   STDERR: "ERROR: {failure_count} thread operation(s) failed. See the warnings above."
   EXIT: 1
 
-OUTPUT: "✅ Verified: all {success_count} claimed threads now isResolved=true"
+OUTPUT: "✅ Verified: {resolved_thread_ids|length} resolved by us, {awaiting_coderabbit|length} resolved by CodeRabbit"
 ```
 
 **Any failure exits non-zero.** A reply or resolve that errors increments `failure_count`, and that
-alone must fail the run — including when *every* operation failed and `touched_thread_ids` is
-therefore empty. Verification is an extra persistence check on top of that, not the only gate.
-Otherwise a run where nothing resolved would exit 0 with every thread still open, and `/ship-it`
-or a CI gate would read that as success.
+alone must fail the run — including when nothing was claimed and the query was skipped entirely.
+Verification is an extra persistence check on top of that, not the only gate. Otherwise a run where
+nothing resolved would exit 0 with every thread still open, and `/ship-it` or a CI gate would read
+that as success.
+
+**Human threads never fail the run.** They are reported, never waited on, and never counted as
+unresolved — leaving them open is the intended outcome, not a defect.
 
 ### PR summary comment
 

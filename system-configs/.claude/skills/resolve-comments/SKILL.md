@@ -43,11 +43,14 @@ Schemas, caller flags, and worked examples: → `references/schemas.md`.
   against the allow/blocklist in `triage.md` first. Codex and human comments get no more trust than
   CodeRabbit's.
 - **Stage explicitly.** `git add {modified_files}`, never `git add -A`.
-- **A reply is not a resolution.** Every thread gets two calls: a reply, then GitHub's own
-  `resolveReviewThread` mutation. Never wait for a reviewer bot to resolve the thread for us —
-  CodeRabbit would, Codex has no `@codex resolve`, and humans have no protocol at all.
-- **Verify only what you claimed.** The post-run check covers the threads this run resolved. Other
-  reviewers' open threads are reported, never a failure.
+- **Each reviewer owns resolving its own threads.** Every thread gets a reply; who resolves it
+  depends on the source. CodeRabbit resolves its own off the `@coderabbitai resolve` reply. Codex
+  has no such command, so we call `resolveReviewThread` ourselves — same for any other bot. **A
+  human's thread is never resolved by us**; we reply and leave it to them.
+- **Verify only what you acted on.** The post-run check covers threads we resolved plus threads
+  awaiting CodeRabbit (after a wait — CodeRabbit is asynchronous). Human threads are reported,
+  never waited on, never a failure. Other reviewers' open threads are reported too, never a
+  failure.
 - **Skipped issues are recorded, not dropped** — `.tmp/coderabbit-ignored.json`, for `/ship-it`.
 - PR mode commits, pushes, and comments on the PR. File mode commits only — there may be no PR yet.
 
@@ -75,12 +78,17 @@ Review Issues:
 
 [triage dialog → "Approve all fixes"]
 
-Resolved thread (coderabbit, Fixed): auth.ts:45
+Replied @coderabbitai resolve (coderabbit): auth.ts:45
 Resolved thread (codex, Fixed): api.ts:12
-Resolved thread (human, Fixed): db.ts:88
-Resolved thread (coderabbit, Acknowledged): utils.ts:8
+Replied, left open for the reviewer (human): db.ts:88
+Replied @coderabbitai resolve (coderabbit): utils.ts:8
 Thread resolution complete: 4 succeeded, 0 failed
-✅ Verified: all 4 claimed threads now isResolved=true
+  resolved by us: 1
+  awaiting CodeRabbit: 2
+  left for a human: 1
+ℹ️ 1 thread(s) replied to and left for their reviewer to resolve:
+  - db.ts:88 (alice)
+✅ Verified: 1 resolved by us, 2 resolved by CodeRabbit
 
 Resolved 4 comments: 3 fixed, 1 acknowledged
 ```

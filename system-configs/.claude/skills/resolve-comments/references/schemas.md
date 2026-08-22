@@ -68,12 +68,16 @@ Fixed: Stale timestamp ages the rate
 
 Committed: fix: resolve PR review feedback (2 issues)
 Pushed to origin
-Resolved thread (coderabbit, Fixed): auth.ts:45
+Replied @coderabbitai resolve (coderabbit): auth.ts:45
 Resolved thread (codex, Fixed): api.ts:12
-Resolved thread (coderabbit, Acknowledged): utils.ts:8
+Replied @coderabbitai resolve (coderabbit): utils.ts:8
 Thread resolution complete: 3 succeeded, 0 failed
-ℹ️ 1 other thread(s) remain open on this PR (not claimed by this run):
+  resolved by us: 1
+  awaiting CodeRabbit: 2
+  left for a human: 0
+ℹ️ 1 other thread(s) remain open on this PR (not acted on by this run):
   - README.md:4 (alice)
+✅ Verified: 1 resolved by us, 2 resolved by CodeRabbit
 Posted resolution summary to PR #42
 
 Resolved 3 comments: 2 fixed, 1 acknowledged
