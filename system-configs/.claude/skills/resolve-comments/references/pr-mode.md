@@ -513,7 +513,7 @@ SET: claimed = resolved_thread_ids + (thread ids in awaiting_coderabbit)
 FILTER: unresolved = nodes where id IN claimed AND isResolved == false
 IF: unresolved non-empty
   STDERR: "ERROR: {n} thread(s) this run acted on are still open:"
-  FOR_EACH: "  - {thread.id} @ {path}:{line ?? originalLine} ({author.login})"
+  FOR_EACH: "  - {thread.id} @ {path}:{line ?? originalLine} ({author.login ?? "deleted-account"})"
     IF: the id is in awaiting_coderabbit
       STDERR: "    replied @coderabbitai resolve but CodeRabbit has not resolved it"
     ELSE
@@ -523,12 +523,12 @@ IF: unresolved non-empty
 REPORT (informational, never fails the run):
   IF: left_to_human non-empty
     OUTPUT "ℹ️ {n} thread(s) replied to and left for their reviewer to resolve:"
-    OUTPUT "  - {location} ({author.login})" for each
+    OUTPUT "  - {location} ({author.login ?? "deleted-account"})" for each
   SET: untouched_open = nodes where isResolved == false AND id NOT IN claimed
        AND id NOT IN (left_to_human thread ids)
   IF: untouched_open non-empty
     OUTPUT "ℹ️ {n} other thread(s) remain open on this PR (not acted on by this run):"
-    OUTPUT "  - {path}:{line ?? originalLine} ({author.login})" for each
+    OUTPUT "  - {path}:{line ?? originalLine} ({author.login ?? "deleted-account"})" for each
 
 IF: failure_count > 0                                   # failure exit
   STDERR: "ERROR: {failure_count} thread operation(s) failed. See the warnings above."
