@@ -117,13 +117,17 @@ KNOWN_REVIEWERS:                        # exact logins, compared case-insensitiv
   codex      → "chatgpt-codex-connector", "chatgpt-codex-connector[bot]"
 
 CLASSIFY(author):                       # author = { login, __typename }
-  login exactly matches a KNOWN_REVIEWERS entry  → that source
   login == authenticated gh user (gh api user --jq .login)
-                                                 → "self"
+                                                 → "self"      # checked FIRST, always
+  login exactly matches a KNOWN_REVIEWERS entry  → that source
   author.__typename == "Bot" OR login ends "[bot]"
                                                  → "bot"
   otherwise                                      → "human"
 ```
+
+**The `self` check runs before every reviewer-source match.** Order matters: if the skill runs under
+an identity that is also a known reviewer, matching the reviewer first would classify its own
+comments as that source and the `self` branch would never fire. Identity beats role.
 
 **Match exactly — never by substring.** A substring test for `"codex"` or `"coderabbit"` also matches
 human logins that merely contain those letters (`codexter`, `coderabbits-fan`). Under `--auto` that
