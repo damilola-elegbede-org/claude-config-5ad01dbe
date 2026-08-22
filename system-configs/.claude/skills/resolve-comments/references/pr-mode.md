@@ -71,6 +71,12 @@ WHILE: has_more_threads
       RUN: fetch additional comments with comments_cursor; APPEND to thread.comments.nodes
 
     SET: root = thread.comments.nodes[0]          # the thread's originating comment
+    IF: root.author is null → SKIP, and count it for the report below
+      `PullRequestReviewComment.author` is nullable — GitHub returns null once the authoring
+      account is deleted. Classifying or reading `.login` off null aborts the whole run, so
+      an unattributable thread is reported and left alone, never acted on automatically.
+      OUTPUT: "Skipped {root.path}:{line} - comment author unavailable (deleted account)"
+
     SET: issue.source = CLASSIFY(root.author)     # see source classification below
     IF: issue.source == "self" → SKIP
       The thread was opened by the account this skill is running as — don't triage our own
