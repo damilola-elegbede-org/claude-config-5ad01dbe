@@ -82,13 +82,24 @@ WHILE: has_more_threads
       The thread was opened by the account this skill is running as — don't triage our own
       review findings.
 
-    IF: ANY comment in thread.comments.nodes (excluding root) has
-          author.login == authenticated_user AND body starts with the resolution marker
-      → APPEND {thread_id, source: issue.source,
+    SET: prior_reply = the LAST comment in thread.comments.nodes (excluding root) where
+           comment.author is non-null AND comment.author.login == authenticated_user
+           AND comment.body starts with the resolution marker
+      NULL-SAFE: `author` is nullable on every comment, not just the root — a deleted account
+        anywhere in the thread returns null. Test `comment.author` before reading `.login`, here
+        and in every other place a comment author is read (the recheck below, and any reporting
+        path). A null author simply doesn't match; it must never abort the run.
+    IF: prior_reply exists
+      → APPEND {thread_id, source: issue.source, reply_body: prior_reply.body,
                  location: "{root.path}:{root.line ?? root.originalLine ?? "?"}"}
         to retry_resolve_issues; CONTINUE to next thread (do not add to all_issues)
         The source travels with it — retrying a stuck thread still respects who owns the
         resolve, so a CodeRabbit thread gets its reply re-posted rather than resolved for it.
+        `reply_body` travels with it too: a CodeRabbit repost needs the exact text to re-send,
+        and `body_prefix`/`body_detail` don't exist on this path — the thread never went
+        through triage this run, so there is no fresh description or reason to compose from.
+        Reposting the stored body verbatim is also the honest thing to send: it is what the
+        earlier run actually concluded, not a new claim made on its behalf.
       An earlier run already replied to this thread but did not finish resolving it — the
       reply landed and the resolve mutation failed, or the run was interrupted between the
       two. `thread.isResolved == false` here proves the resolve never completed, since an
@@ -294,8 +305,10 @@ FOR_EACH: issue in retry_resolve_issues   # our reply already exists — never r
     on it. Re-post that reply — it is the only lever we have — rather than resolving the thread
     out from under CodeRabbit. This is the one case where a repost is correct: the reply is a
     command that failed to take, not a duplicate finding.
-    RE-POST: "@coderabbitai resolve - {body_prefix}: {body_detail}" via the same file-based path
-      used in the main loop below
+    RE-POST: `issue.reply_body` verbatim, via the same file-based path used in the main loop
+      below. It already carries the "@coderabbitai resolve" prefix — it is the exact text the
+      earlier run posted. Do not recompose it: there is no triage result on this path to
+      compose from, and re-sending the original is what makes the retry a retry.
     APPEND issue to awaiting_coderabbit; INCREMENT success_count
     OUTPUT "Re-posted @coderabbitai resolve (prior reply did not take): {issue.location}"
     CONTINUE
@@ -325,18 +338,25 @@ FOR_EACH: issue in retry_resolve_issues   # our reply already exists — never r
   against another run's successful resolve is safe.
 
 FOR_EACH: issue in all_issues          # every thread needs its own mutation — never batch
-  RECHECK: single-thread GraphQL query for issue.thread_id → { isResolved, comments(last: 5)
-    { nodes { author { login } body } } } immediately before composing this issue's reply.
+  RECHECK: single-thread GraphQL query for issue.thread_id → { isResolved,
+    comments(first: 100, after: $cursor) { pageInfo { endCursor hasNextPage }
+    nodes { author { login } body } } } immediately before composing this issue's reply,
+    paginating until hasNextPage is false.
+    **Read the whole comment list, never a trailing window.** A `comments(last: 5)` peek is
+    wrong here: on a busy thread, later chatter pushes an earlier resolution marker out of the
+    window, the recheck concludes the thread is unclaimed, and the fix and reply are duplicated —
+    the exact failure this recheck exists to prevent. Only a full scan proves no marker exists.
     This narrows, not eliminates, the window between STEP 2's fetch and this write — it catches
     a concurrent run that claimed the same thread while this run was mid-triage (fix generation,
     the commit/push confirmation prompt) without requiring a distributed lock.
     IF: isResolved == true → OUTPUT "Skipped {issue.location} - resolved by another run since
       fetch"; CONTINUE to next issue (do not reply, do not resolve — already done)
-    IF: ANY comment (excluding root) has author.login == authenticated_user AND body starts
-      with the resolution marker → OUTPUT "Skipped {issue.location} - claimed by another run
-      since fetch"; hand this thread to the `retry_resolve_issues` branch above and follow it
-      for this issue.source (human → leave open, coderabbit → re-post the resolve reply,
-      codex/bot → resolve-only mutation), then CONTINUE to next issue
+    IF: ANY comment (excluding root) has author non-null AND author.login == authenticated_user
+      AND body starts with the resolution marker → OUTPUT "Skipped {issue.location} - claimed by
+      another run since fetch"; hand this thread to the `retry_resolve_issues` branch above,
+      carrying that comment's body as `reply_body`, and follow it for this issue.source
+      (human → leave open, coderabbit → re-post the resolve reply, codex/bot → resolve-only
+      mutation), then CONTINUE to next issue
   IF: issue.thread_id missing/empty
     APPEND {location, status:"skipped", error:"missing thread_id"}; INCREMENT failure_count
     OUTPUT "Warning: Skipped {issue.location} - missing thread_id"; CONTINUE
