@@ -9,7 +9,7 @@
     "CLAUDE_CODE_ENABLE_EXPERIMENTAL_ADVISOR_TOOL": "1"
   },
   "model": "claude-opus-5",
-  "advisorModel": "claude-fable-5",
+  "advisorModel": "fable",
   "outputStyle": "Concise",
   "tui": "fullscreen",
   "agentPushNotifEnabled": true,
