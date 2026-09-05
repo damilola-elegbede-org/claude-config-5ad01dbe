@@ -109,9 +109,11 @@ def parse_yaml_structure(yaml_text):
 
                 # Check for valid model values
                 if field == 'model':
-                    # Short aliases plus explicit full IDs for tiers without a
-                    # stable alias (Fable 5 — premium advisor tier, ENG-1315).
-                    valid_models = ['opus', 'sonnet', 'haiku', 'fable', 'claude-fable-5']
+                    # Family aliases only. A version-pinned id ('claude-fable-5')
+                    # silently breaks when the family rolls: the advisor API rejects
+                    # an advisor older than the request model, so a Fable 5 pin 400s
+                    # every advisor() call once sessions move to Fable 5.1.
+                    valid_models = ['opus', 'sonnet', 'haiku', 'fable']
                     if value and value not in valid_models:
                         issues.append(f"Invalid model '{value}'. Must be one of: {', '.join(valid_models)}")
 
