@@ -31,6 +31,9 @@ Thumbs.db
 # Performance cache directory
 .cache/
 
+# Agent-local scratch state (activity logs, codex review cache) — never tracked
+.state/
+
 # Test artifacts
 test-results.log
 test-output.log
