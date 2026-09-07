@@ -54,6 +54,19 @@ iso_in() {
 #       <exhausted> [weekly_in_secs] [session_in_secs]
 cache() {
     local wk_in="${8:-131400}" se_in="${9:-5400}"
+    local wk_ts se_ts
+    wk_ts="$(iso_in "$wk_in")"
+    se_ts="$(iso_in "$se_in")"
+    # Callers that need to corrupt one of these values (the "unparsable
+    # reset" tests) read them back from these files rather than calling
+    # iso_in a second time to reconstruct the string — two independent
+    # `date`-based calls for the same offset can land a second apart and
+    # disagree, which used to make the later substitution silently no-op
+    # and leave a real, parsable timestamp in place. `cache` runs inside a
+    # `$(...)` command substitution, so a plain variable assignment here
+    # would be lost to the subshell; a file survives it.
+    printf '%s' "$wk_ts" > "$TEST_TEMP_DIR/.cache_wk_ts"
+    printf '%s' "$se_ts" > "$TEST_TEMP_DIR/.cache_se_ts"
     cat <<EOF
 {
   "extra_usage": { "spend_limit_reached": $7 },
@@ -63,9 +76,9 @@ cache() {
     "percent": $6, "enabled": $3
   },
   "limits": [
-    { "kind": "session",       "percent": $2, "resets_at": "$(iso_in "$se_in")" },
-    { "kind": "weekly_all",    "percent": $1, "resets_at": "$(iso_in "$wk_in")" },
-    { "kind": "weekly_scoped", "percent": 25, "resets_at": "$(iso_in "$wk_in")" }
+    { "kind": "session",       "percent": $2, "resets_at": "$se_ts" },
+    { "kind": "weekly_all",    "percent": $1, "resets_at": "$wk_ts" },
+    { "kind": "weekly_scoped", "percent": 25, "resets_at": "$wk_ts" }
   ]
 }
 EOF
@@ -185,7 +198,7 @@ print_info "Both exhausted with one unreadable reset: no burn rather than a gues
 # defaulting to weekly would understate burn whenever the session reset trails
 # it. The credits bar and dollars still render, so spend is never hidden.
 ONEBAD=$(cache 100 100 true 75160 200000 38 false 3600 10800)
-ONEBAD=${ONEBAD//$(iso_in 10800)/not-a-timestamp}
+ONEBAD=${ONEBAD//$(cat "$TEST_TEMP_DIR/.cache_se_ts")/not-a-timestamp}
 OUT=$(render "$ONEBAD")
 assert_contains "$OUT" "credits "  "still in credit mode"
 assert_contains "$OUT" "38%"       "cap utilisation still shown"
@@ -201,7 +214,7 @@ assert_missing  "$OUT" "burn"    "no ratio to show once the cap is gone"
 echo
 print_info "Unparsable reset falls back to a blank burn"
 BAD=$(cache 100 14 true 75160 200000 38 false)
-BAD=${BAD//$(iso_in 131400)/not-a-timestamp}
+BAD=${BAD//$(cat "$TEST_TEMP_DIR/.cache_wk_ts")/not-a-timestamp}
 OUT=$(render "$BAD")
 assert_contains "$OUT" "burn --" "no number invented from an unreadable reset"
 
