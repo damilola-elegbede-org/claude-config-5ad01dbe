@@ -667,6 +667,84 @@ elif [[ -f "$usage_cache" ]]; then
   usage_segment="$usage_parts"
 fi
 
+# ---- Codex segment: the fleet's Codex rate-limit snapshot ----
+# Reads infra/.state/codex-usage.json, written every 30 min by bareclaude's
+# infra/scripts/codex-usage-read.sh (ENG-2314) from `codex app-server`
+# account/rateLimits/read. This script only READS that file - it never runs
+# `codex` itself, which costs ~2s per refresh and would stall every redraw.
+# One bar per window of the `codex` limit (same glyphs and heat tiers as the
+# Claude meters above), shortest window first, labelled from the window
+# length (300 min -> 5h, 10080 -> wk, otherwise Nm/Nh/Nd), then the longest
+# window's burn ratio when the reader computed one (same tiers as the Claude
+# weekly burn; omitted when null). Fail-closed: a missing file, a status
+# other than ok, an unreadable fetched_at, or a snapshot older than 2h all
+# render "codex --" - a stale percentage must never look current. Rendered
+# even when the Claude segment is absent, so a dead file is visible.
+codex_state="${BARECLAUDE_ROOT:-/Users/daelegbe/BareClaude}/infra/.state/codex-usage.json"
+codex_segment=$(printf 'codex \033[90m--\033[0m')
+if [[ -f "$codex_state" ]]; then
+  # Same per-line read as the Claude block above (bash 3.2, no mapfile). Rows
+  # 0-1 are status and fetched_at; every row after is one window as
+  # "minutes used_percent burn_ratio", with "-" standing in for a null burn so
+  # a missing field can't shift the columns.
+  codex_rows=()
+  while IFS= read -r codex_row; do
+    codex_rows+=("$codex_row")
+  done < <(jq -r '
+    (.status // ""),
+    (.fetched_at // ""),
+    ((.limits.codex.windows // [])
+      | map(select((.minutes | type) == "number"))
+      | sort_by(.minutes)[]
+      | "\(.minutes) \(.used_percent // "-") \(.burn_ratio // "-")")
+  ' "$codex_state" 2>/dev/null)
+  codex_status="${codex_rows[0]:-}"
+  codex_fetched_epoch=$(iso_to_epoch "${codex_rows[1]:-}")
+  codex_now_epoch=$(date -u +%s)
+  if [[ "$codex_status" == "ok" ]] && [[ "$codex_fetched_epoch" =~ ^[0-9]+$ ]] \
+     && [[ $(( codex_now_epoch - codex_fetched_epoch )) -le 7200 ]] \
+     && [[ ${#codex_rows[@]} -gt 2 ]]; then
+    codex_parts=""
+    codex_burn=""
+    for codex_row in "${codex_rows[@]:2}"; do
+      read -r cw_min cw_pct cw_burn <<< "$codex_row"
+      cw_pct=${cw_pct%.*}
+      [[ "$cw_min" =~ ^[0-9]+$ ]] || continue
+      [[ "$cw_pct" =~ ^[0-9]+$ ]] || continue
+      case "$cw_min" in
+        300)   cw_label="5h" ;;
+        10080) cw_label="wk" ;;
+        *)
+          if   [[ $cw_min -ge 1440 ]] && [[ $(( cw_min % 1440 )) -eq 0 ]]; then cw_label="$(( cw_min / 1440 ))d"
+          elif [[ $cw_min -ge 60 ]]   && [[ $(( cw_min % 60 )) -eq 0 ]];   then cw_label="$(( cw_min / 60 ))h"
+          else cw_label="${cw_min}m"; fi ;;
+      esac
+      cw_part=$(printf '%s%s %s%%\033[0m %s' "$(heat_color "$cw_pct")" "$(heat_bar "$cw_pct")" "$cw_pct" "$cw_label")
+      [[ -n "$codex_parts" ]] && codex_parts+=" · "
+      codex_parts+="$cw_part"
+      # Rows are sorted ascending, so the last parsable burn is the longest window's.
+      [[ "$cw_burn" =~ ^[0-9]+(\.[0-9]+)?$ ]] && codex_burn="$cw_burn"
+    done
+    if [[ -n "$codex_parts" ]] && [[ -n "$codex_burn" ]]; then
+      # Round first, then classify off the displayed value - same rule and
+      # tiers as the Claude weekly burn so one colour means one thing.
+      codex_burn_calc=$(awk -v r="$codex_burn" 'BEGIN{
+        if (r > 9.9) r = 9.9
+        disp = sprintf("%.1f", r) + 0
+        if (disp < 0.5) tier = "blue"
+        else if (disp < 1.1) tier = "green"
+        else if (disp < 1.3) tier = "yellow"
+        else if (disp < 1.5) tier = "orange"
+        else tier = "red"
+        printf "%.1f\t%s", disp, tier
+      }')
+      IFS=$'\t' read -r codex_burn_val codex_burn_tier <<< "$codex_burn_calc"
+      codex_parts+=" · $(printf 'burn %s%sx\033[0m' "$(burn_color "$codex_burn_tier")" "$codex_burn_val")"
+    fi
+    [[ -n "$codex_parts" ]] && codex_segment="codex $codex_parts"
+  fi
+fi
+
 # Context rendered as label + bar + percentage with the same heat map
 if [[ "$ctx_display" == "--" ]]; then
   ctx_render=$(printf 'context \033[90m--\033[0m')
@@ -695,4 +773,5 @@ printf '\033[31m%s\033[0m \033[90m•\033[0m \033[38;5;208m%s\033[0m \033[90m•
 if [[ -n "$usage_segment" ]]; then
   printf ' \033[90m•\033[0m %s' "$usage_segment"
 fi
+printf ' \033[90m•\033[0m %s' "$codex_segment"
 printf '\n'

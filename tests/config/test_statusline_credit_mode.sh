@@ -77,7 +77,10 @@ render() {
     mkdir -p "$h/.claude"
     printf '%s' "$1" > "$h/.claude/.usage_cache.json"
     LAST_HOME="$h"
-    printf '%s' "$STDIN_JSON" | HOME="$h" bash "$STATUSLINE_PATH" 2>/dev/null \
+    # BARECLAUDE_ROOT is pinned to the empty test home so the Codex segment
+    # renders "codex --" rather than reading this machine's live state file
+    # (whose "burn N.Nx" would collide with the whole-line burn assertions).
+    printf '%s' "$STDIN_JSON" | HOME="$h" BARECLAUDE_ROOT="$h" bash "$STATUSLINE_PATH" 2>/dev/null \
         | sed $'s/\033\\[[0-9;]*m//g'
 }
 
