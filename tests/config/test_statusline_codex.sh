@@ -12,6 +12,8 @@
 #   - fail-closed rendering ("codex --") for a missing file, a status other
 #     than ok, an unreadable fetched_at, or a snapshot older than 2h - and
 #     never a stale percentage
+#   - no segment at all when the fleet state directory itself is absent (a
+#     synced laptop with no BareClaude tree gets no dead "codex --")
 #   - other limit ids in the file (codex_bengalfox) never leak into the line
 #
 # The statusline must never call `codex` itself; these tests put a `codex`
@@ -112,11 +114,17 @@ EOC
 }
 
 # render_raw [fixture-json] -> statusline with ANSI intact.
-# No argument = no state file at all (the missing-file case).
+# No argument = state directory present but no state file (the missing-file
+# case). NO_STATE_DIR=1 leaves out the infra/.state directory altogether.
 render_raw() {
     local root="$TEST_TEMP_DIR/root_$RANDOM$RANDOM"
     local h="$TEST_TEMP_DIR/home_$RANDOM$RANDOM"
-    mkdir -p "$root/infra/.state" "$h/.claude"
+    mkdir -p "$h/.claude"
+    if [[ "${NO_STATE_DIR:-0}" == "1" ]]; then
+        mkdir -p "$root"
+    else
+        mkdir -p "$root/infra/.state"
+    fi
     claude_cache > "$h/.claude/.usage_cache.json"
     if [[ $# -gt 0 ]]; then
         printf '%s' "$1" > "$root/infra/.state/codex-usage.json"
@@ -225,15 +233,38 @@ assert_missing "$OUT" "53%" "stale weekly percentage not shown"
 assert_missing "$OUT" "1.4x" "stale burn not shown"
 
 echo
+print_info "Future fetched_at (negative age) renders codex -- and never its numbers"
+OUT=$(render "$(fixture ok "$(iso_in 600)" "[$(window 300 37 null), $(window 10080 53 1.4)]")")
+assert_eq "$(codex_part "$OUT")" "codex --" "future snapshot is dashed"
+assert_missing "$OUT" "37%" "future 5h percentage not shown"
+assert_missing "$OUT" "53%" "future weekly percentage not shown"
+assert_missing "$OUT" "1.4x" "future burn not shown"
+
+echo
 print_info "Snapshot inside the 2h window is still live"
 OUT=$(render "$(fixture ok "$(iso_in -7000)" "[$(window 10080 53 null)]")")
 assert_eq "$(codex_part "$OUT")" "codex ▓▓▓░░ 53% wk" "1h56m old is fresh enough"
 
 echo
-print_info "Missing state file renders codex --"
+print_info "Missing state file (directory present) renders codex --"
 OUT=$(render)
 assert_eq "$(codex_part "$OUT")" "codex --" "no file, dashed segment"
 assert_contains "$OUT" "all ▓▓▓░░ 62%" "Claude meters unaffected by a missing Codex file"
+
+echo
+print_info "Missing state directory renders no codex segment at all"
+OUT=$(NO_STATE_DIR=1 render)
+# Matched on the extracted segment, not the whole line: the git branch name
+# in the line may legitimately contain the word "codex".
+assert_eq "$(codex_part "$OUT")" "" "no fleet tree, no segment (not even codex --)"
+assert_missing "$OUT" "• codex" "no codex separator on the line"
+assert_contains "$OUT" "all ▓▓▓░░ 62%" "Claude meters unaffected"
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ "$OUT" == *"5h ▓▓░░░ 45%" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1)); print_pass "line ends at the Claude meters with no trailing separator"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1)); print_fail "line ends at the Claude meters with no trailing separator (got: $OUT)"
+fi
 
 echo
 print_info "status != ok renders codex -- even if limits are present"

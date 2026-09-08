@@ -679,9 +679,16 @@ fi
 # weekly burn; omitted when null). Fail-closed: a missing file, a status
 # other than ok, an unreadable fetched_at, or a snapshot older than 2h all
 # render "codex --" - a stale percentage must never look current. Rendered
-# even when the Claude segment is absent, so a dead file is visible.
-codex_state="${BARECLAUDE_ROOT:-/Users/daelegbe/BareClaude}/infra/.state/codex-usage.json"
-codex_segment=$(printf 'codex \033[90m--\033[0m')
+# even when the Claude segment is absent, so a dead file is visible. The one
+# exception is a machine with no fleet state directory at all (a synced
+# laptop without a BareClaude tree): there the segment is omitted entirely
+# rather than pinned at a permanent "codex --".
+codex_state_dir="${BARECLAUDE_ROOT:-/Users/daelegbe/BareClaude}/infra/.state"
+codex_state="$codex_state_dir/codex-usage.json"
+codex_segment=""
+if [[ -d "$codex_state_dir" ]]; then
+  codex_segment=$(printf 'codex \033[90m--\033[0m')
+fi
 if [[ -f "$codex_state" ]]; then
   # Same per-line read as the Claude block above (bash 3.2, no mapfile). Rows
   # 0-1 are status and fetched_at; every row after is one window as
@@ -702,6 +709,7 @@ if [[ -f "$codex_state" ]]; then
   codex_fetched_epoch=$(iso_to_epoch "${codex_rows[1]:-}")
   codex_now_epoch=$(date -u +%s)
   if [[ "$codex_status" == "ok" ]] && [[ "$codex_fetched_epoch" =~ ^[0-9]+$ ]] \
+     && [[ $(( codex_now_epoch - codex_fetched_epoch )) -ge 0 ]] \
      && [[ $(( codex_now_epoch - codex_fetched_epoch )) -le 7200 ]] \
      && [[ ${#codex_rows[@]} -gt 2 ]]; then
     codex_parts=""
@@ -773,5 +781,7 @@ printf '\033[31m%s\033[0m \033[90m•\033[0m \033[38;5;208m%s\033[0m \033[90m•
 if [[ -n "$usage_segment" ]]; then
   printf ' \033[90m•\033[0m %s' "$usage_segment"
 fi
-printf ' \033[90m•\033[0m %s' "$codex_segment"
+if [[ -n "$codex_segment" ]]; then
+  printf ' \033[90m•\033[0m %s' "$codex_segment"
+fi
 printf '\n'
