@@ -36,8 +36,7 @@ TESTS_FAILED=0
 # it from tests/), matching the sibling statusline suites.
 cd "$(dirname "$0")"
 
-TEST_TEMP_DIR="/tmp/statusline_codex_test_$$"
-mkdir -p "$TEST_TEMP_DIR"
+TEST_TEMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/statusline_codex_test.XXXXXX")"
 
 STATUSLINE_PATH="$(cd ../../system-configs/.claude && pwd)/statusline.sh"
 
@@ -201,6 +200,11 @@ echo
 print_info "Burn is omitted, not dashed, when the reader has none"
 OUT=$(render "$(fixture ok "$(iso_in -600)" "[$(window 300 30 null), $(window 10080 62 null)]")")
 assert_eq "$(codex_part "$OUT")" "codex ▓▓░░░ 30% 5h · ▓▓▓░░ 62% wk" "no burn slot without a ratio"
+
+echo
+print_info "Shorter window's burn ratio never leaks past a null longest window"
+OUT=$(render "$(fixture ok "$(iso_in -600)" "[$(window 300 30 1.7), $(window 10080 62 null)]")")
+assert_eq "$(codex_part "$OUT")" "codex ▓▓░░░ 30% 5h · ▓▓▓░░ 62% wk" "5h has a ratio but wk (longest) does not; burn omitted, not 1.7x"
 
 echo
 print_info "Glyphs and colours match the Claude meters"

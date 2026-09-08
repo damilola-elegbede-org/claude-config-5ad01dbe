@@ -730,7 +730,10 @@ if [[ -f "$codex_state" ]]; then
       cw_part=$(printf '%s%s %s%%\033[0m %s' "$(heat_color "$cw_pct")" "$(heat_bar "$cw_pct")" "$cw_pct" "$cw_label")
       [[ -n "$codex_parts" ]] && codex_parts+=" · "
       codex_parts+="$cw_part"
-      # Rows are sorted ascending, so the last parsable burn is the longest window's.
+      # Rows are sorted ascending. Reset on every iteration so a shorter window's
+      # burn ratio can never survive past the longest window when the longest
+      # window's own burn_ratio is null.
+      codex_burn=""
       [[ "$cw_burn" =~ ^[0-9]+(\.[0-9]+)?$ ]] && codex_burn="$cw_burn"
     done
     if [[ -n "$codex_parts" ]] && [[ -n "$codex_burn" ]]; then
