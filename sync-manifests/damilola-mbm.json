@@ -12,6 +12,7 @@
       "model",
       "env",
       "advisorModel",
+      "autoCompactWindow",
       "outputStyle",
       "hooks",
       "statusLine",
