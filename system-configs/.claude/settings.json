@@ -5,11 +5,11 @@
     "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "1",
     "DISABLE_FEEDBACK_COMMAND": "1",
     "CLAUDE_CODE_DISABLE_GROWTHBOOK": "1",
-    "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "60",
     "CLAUDE_CODE_ENABLE_EXPERIMENTAL_ADVISOR_TOOL": "1"
   },
-  "model": "opus",
+  "model": "sonnet",
   "advisorModel": "fable",
+  "autoCompactWindow": "400000",
   "outputStyle": "Concise",
   "tui": "fullscreen",
   "agentPushNotifEnabled": true,
@@ -35,9 +35,7 @@
   "skipDangerousModePermissionPrompt": true,
   "teammateMode": "tmux",
   "theme": "dark",
-  "trustedDirectories": [
-    "/Users/daelegbe"
-  ],
+  "trustedDirectories": ["/Users/daelegbe"],
   "statusLine": {
     "type": "command",
     "command": "${HOME}/.claude/statusline.sh"
