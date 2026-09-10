@@ -9,6 +9,9 @@ jobs:
     name: Test Changes
     runs-on: ubuntu-latest
     timeout-minutes: 10  # Prevent indefinite hangs
+    permissions:
+      contents: read
+      pull-requests: read
 
     env:
       CI: true
@@ -123,6 +126,8 @@ jobs:
   skill-validation:
     name: Validate Skills
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
 
     steps:
     - name: Checkout code
@@ -242,6 +247,8 @@ jobs:
   security-check:
     name: Security Scan
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
 
     steps:
     - name: Checkout code
